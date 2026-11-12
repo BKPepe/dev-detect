@@ -17,11 +17,14 @@ Package include simple cli interface called `dev-detect` to interact with device
 
 You can use one of following commands:
 ```
-search <MAC>        Search device by MAC address
-remove <MAC>        Delete specified MAC address
-list                List known devices
-clear               Clear/reset database
+search <MAC>               Search device by MAC address
+add <MAC> [--name NAME]    Mark device as known, so that it is not reported
+remove <MAC>               Delete specified MAC address
+list                       List known devices
+clear                      Clear/reset database
 ```
+
+Devices become known when they are reported. `list` shows where and when they were first and last seen and their hostname. A device can be marked as known in advance with `add`, and `remove` makes it reported again next time it appears.
 
 For full options see help:
 ```
@@ -40,6 +43,33 @@ IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac
 ```
 
 The vendor is looked up by `ouidb`. Devices using a private (randomized) MAC address have no vendor and may be reported again when their address changes.
+
+## Networks
+
+A device is reported when it appears on a watched network for the first time, so that e.g. a device getting from the guest network into the private one is reported too. Devices added by `dev-detect add` (or stored by older versions) are known on every network. To report each device only once, wherever it appears, set:
+
+```
+config detection 'detection'
+    option per_network '0'
+```
+
+## Static DHCP leases
+
+Devices with a static DHCP lease (`config host` in `/etc/config/dhcp`) are known to the administrator, so they are stored without being reported, named after the lease. To report them as well, set:
+
+```
+config detection 'detection'
+    option known_static_leases '0'
+```
+
+## Empty database
+
+When the device database is empty when the daemon starts (on the first start, or when the service starts after `dev-detect clear` or after the database was lost), devices that are present are stored without reporting each of them, and a single notification lists them. To report each of them instead, set:
+
+```
+config detection 'detection'
+    option learn_on_empty '0'
+```
 
 ## Persistence
 

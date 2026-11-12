@@ -218,3 +218,42 @@ def test_report_never_raises(monkeypatch, caplog):
     notify.report(MAC, '192.168.1.50', 'br-lan')
 
     assert 'Cannot report new device' in caplog.text
+
+
+@pytest.mark.parametrize('callback_fails', [False, True])
+def test_report_passes_details_before_sending(monkeypatch, caplog, callback_fails):
+    events = []
+    monkeypatch.setattr(notify, 'gather', lambda mac, ip, iface: device())
+    monkeypatch.setattr(notify, 'send', lambda dev: events.append('send'))
+
+    def on_details(dev):
+        events.append(('details', dev.hostname))
+        if callback_fails:
+            raise RuntimeError('database is broken')
+    notify.report(MAC, '192.168.1.50', 'br-lan', on_details)
+
+    assert events == [('details', 'Mac'), 'send']
+    assert ('Cannot process details' in caplog.text) == callback_fails
+
+
+def test_compose_learned(monkeypatch):
+    monkeypatch.setattr(notify, 'LEARNED_LIMIT', 2)
+    devices = [
+        (MAC, ['br-lan', 'br-guest-turris'], 'Mac'),
+        ('02:00:00:00:00:02', ['br-lan'], None),
+        ('02:00:00:00:00:09', ['br-guest-turris'], 'phone'),
+    ]
+    networks = {'br-lan': 'lan', 'br-guest-turris': 'guest_turris'}
+
+    assert notify.compose_learned(devices, 'en', networks) == (
+        'The device database was empty at start, so devices already present were stored'
+        ' without separate notifications (3):\n'
+        '3e:f1:18:4d:d9:23 (Mac, lan, guest_turris)\n'
+        '02:00:00:00:00:02 (lan)\n'
+        'more: 1 (dev-detect list)'
+    )
+    assert notify.compose_learned(devices[1:2], 'cs') == (
+        'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
+        ' bez samostatných oznámení (1):\n'
+        '02:00:00:00:00:02 (br-lan)'
+    )

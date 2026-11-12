@@ -1,10 +1,15 @@
 import errno
 import logging
 import os
+import sqlite3
+import sys
+import threading
+import types
 
 import pytest
 
 import dev_detect.__main__ as daemon
+from dev_detect import notify
 from dev_detect.storage import DatabaseStorage, StorageError
 
 MAC = '3e:f1:18:4d:d9:23'
@@ -29,23 +34,29 @@ class FailingStorage:
         self.search_fails = search_fails
         self.broken = True
         self.macs = set()
+        self.stored = []
 
-    def search(self, mac):
+    def search(self, mac, iface=None):
         if self.broken and self.search_fails:
             raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_IOERR')
         return mac in self.macs
 
-    def store(self, mac):
+    def touch(self, mac):
+        if self.broken:
+            raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_READONLY: attempt to write a readonly database')
+
+    def store(self, mac, iface=''):
         if self.broken:
             raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_READONLY: attempt to write a readonly database')
         self.macs.add(mac)
+        self.stored.append((mac, iface))
         return True
 
 
 @pytest.fixture
 def notified(monkeypatch):
     sent = []
-    monkeypatch.setattr(daemon, 'new_device_notify', lambda mac, ip, family, iface: sent.append(mac))
+    monkeypatch.setattr(daemon, 'new_device_notify', lambda mac, ip, family, iface, **kwargs: sent.append(mac))
     return sent
 
 
@@ -93,7 +104,7 @@ def test_unsaved_devices_are_stored_once_database_works(notified):
     feed(tracker, [Message(OTHER_MAC, '192.168.1.51', family=2)] + EVENTS)
 
     assert notified == [MAC, OTHER_MAC]
-    assert storage.macs == {MAC, OTHER_MAC}
+    assert sorted(storage.stored) == [(MAC, 'br-lan'), (OTHER_MAC, 'br-lan')]  # with the interface
     assert not tracker.unsaved
 
 
@@ -355,3 +366,274 @@ def test_other_netlink_errors_are_raised(tmp_path):
     ipr = FakeIPRoute(OSError(errno.EBADF, 'Bad file descriptor'))
     with pytest.raises(OSError):
         daemon.detect_devices(ipr, INTERFACES, ('br-lan',), tracker, ipr)
+
+
+def test_hostname_found_for_notification_is_stored(tmp_path):
+    """It is found in the notification thread, which needs its own connection"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path))
+    assert tracker.is_new(MAC, 'br-lan')
+    device = notify.Device(MAC, 'br-lan')
+    device.hostname = 'Mac'
+
+    thread = threading.Thread(target=tracker.remember_details, args=(device,))
+    thread.start()
+    thread.join()
+
+    assert DatabaseStorage(db_path).devices()[0][5] == 'Mac'
+
+
+def test_last_seen_is_written_at_most_once_per_interval(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(daemon.time, 'monotonic', lambda: clock[0])
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    touched = []
+    original_touch = storage.touch
+    storage.touch = lambda mac: (touched.append(clock[0]), original_touch(mac))
+    tracker = daemon.DeviceTracker(storage)
+
+    for _ in range(3):
+        assert not tracker.is_new(MAC, 'br-lan')
+        clock[0] += 60
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    assert not tracker.is_new(MAC, 'br-lan')
+
+    assert touched == [1000.0, 1180.0 + daemon.LAST_SEEN_INTERVAL]
+
+
+def test_last_seen_is_written_only_when_presence_is_confirmed(tmp_path):
+    """Entries of departed devices stay STALE in the neighbour table for long"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    touched = []
+    storage.touch = touched.append
+    tracker = daemon.DeviceTracker(storage)
+    feed(tracker, [Message(MAC, '192.168.1.50', family=2, state=0x04)])  # STALE
+    assert touched == []
+    feed(tracker, [Message(MAC, '192.168.1.50', family=2, state=0x02)])  # REACHABLE
+    assert touched == [MAC]
+
+
+@pytest.fixture
+def learned(monkeypatch):
+    devices = []
+    monkeypatch.setattr(daemon.notify, 'learned_devices', devices.extend)
+    return devices
+
+
+def start(tracker, *neighbours):
+    """What main() does before waiting for broadcast messages"""
+    tracker.start_learning()
+    ipr = FakeIPRoute(links=[Link('RTM_NEWLINK', IFINDEX, 'br-lan')], neighbours=list(neighbours))
+    daemon.synchronize(ipr, {}, ('br-lan',), tracker)
+    tracker.finish_learning()
+
+
+def test_devices_present_at_start_with_empty_database_are_learned(tmp_path, notified, learned):
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')))
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+    feed(tracker, [Message('02:00:00:00:00:99', '192.168.1.99', family=2)])
+
+    assert learned == [(MAC, ['br-lan'], None), (OTHER_MAC, ['br-lan'], None)]
+    assert notified == ['02:00:00:00:00:99']
+    assert tracker.storage.search(MAC) and tracker.storage.search(OTHER_MAC)
+
+
+def test_nothing_is_learned_with_known_devices(tmp_path, notified, learned):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(storage)
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+
+    assert learned == []
+    assert notified == [OTHER_MAC]
+
+
+class ConfigEUci:
+    """Stand-in for euci.EUci with given dev-detect options, defaults otherwise"""
+    def __init__(self, **options):
+        self.options = options
+
+    def get(self, config, section, option, dtype=str, default=None, list=False):
+        assert config == 'dev-detect'
+        return self.options.get(option, default)
+
+
+def test_config_defaults():
+    config = daemon.read_config(ConfigEUci())
+
+    assert config == {
+        'db_path': '/srv/dev-detect/dev-detect.db',
+        'interfaces': ('br-lan', 'br-guest-turris', 'br-guest_turris'),
+        'learn_on_empty': True,
+        'known_static_leases': True,
+        'per_network': True,
+    }
+    assert not daemon.read_config(ConfigEUci(learn_on_empty=False))['learn_on_empty']
+
+
+def test_hostnames_of_learned_devices_are_stored(tmp_path, notified, learned, monkeypatch):
+    leases = tmp_path / 'dhcp.leases'
+    leases.write_text('1731440000 3e:f1:18:4d:d9:23 192.168.1.50 Mac 01:3e:f1:18:4d:d9:23\n')
+    monkeypatch.setattr(notify, 'DNSMASQ_LEASES', str(leases))
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')))
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+
+    assert learned == [(MAC, ['br-lan'], 'Mac'), (OTHER_MAC, ['br-lan'], None)]
+    assert [(row[0], row[5]) for row in tracker.storage.devices()] == [(MAC, 'Mac'), (OTHER_MAC, None)]
+
+
+class DhcpEUci:
+    """Stand-in for euci.EUci with static leases in /etc/config/dhcp"""
+    reads = 0
+    sections = {
+        'dnsmasq': ('dnsmasq', {'domain': 'lan'}),
+        'printer': ('host', {'mac': '02:00:00:00:00:01', 'name': 'printer', 'ip': '192.168.1.200'}),
+        'cfg0a1b2c': ('host', {'mac': ('AA:BB:CC:DD:EE:FF',)}),
+        'tv': ('host', {'mac': '02:00:00:00:00:02 02-00-00-00-00-03', 'name': 'tv'}),
+    }
+
+    def __enter__(self):
+        DhcpEUci.reads += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, config, section=None, option=None, default=None, **kwargs):
+        assert config == 'dhcp'
+        if section is None:
+            return {name: options for name, (_, options) in self.sections.items()}
+        return self.sections[section][0]
+
+
+@pytest.fixture
+def dhcp(monkeypatch):
+    DhcpEUci.reads = 0
+    monkeypatch.setitem(sys.modules, 'euci', types.SimpleNamespace(EUci=DhcpEUci))
+    return DhcpEUci
+
+
+@pytest.mark.parametrize('mac, name', [
+    ('02:00:00:00:00:01', 'printer'),
+    ('aa:bb:cc:dd:ee:ff', ''),
+    ('02:00:00:00:00:03', 'tv'),
+    ('02:00:00:00:00:04', None),
+])
+def test_static_lease(dhcp, mac, name):
+    assert daemon.static_lease(mac) == name
+
+
+def test_devices_with_static_lease_are_known(tmp_path, notified, dhcp):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, known_static_leases=True)
+    feed(tracker, [Message('02:00:00:00:00:01', '192.168.1.200', family=2)] * 3 + EVENTS)
+
+    assert notified == [MAC]
+    assert [(row[0], row[1]) for row in storage.devices()] == [('02:00:00:00:00:01', 'printer'), (MAC, None)]
+    assert dhcp.reads == 2  # only for unknown devices
+
+
+def test_static_leases_can_be_reported(tmp_path, notified, dhcp):
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), known_static_leases=False)
+    feed(tracker, [Message('02:00:00:00:00:01', '192.168.1.200', family=2)])
+
+    assert notified == ['02:00:00:00:00:01']
+    assert dhcp.reads == 0
+
+
+GUEST_IFINDEX = 9
+BOTH_NETWORKS = {IFINDEX: 'br-lan', GUEST_IFINDEX: 'br-guest-turris'}
+
+
+def feed_networks(tracker, messages):
+    for message in messages:
+        daemon.process_netlink_message(message, BOTH_NETWORKS, tracker)
+
+
+@pytest.mark.parametrize('per_network, expected', [(True, [MAC, MAC]), (False, [MAC])])
+def test_device_moving_to_another_network(tmp_path, notified, per_network, expected):
+    """E.g. a device of a guest getting into the private network"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, per_network=per_network)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)] * 2)
+    feed_networks(tracker, [Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX)] * 2)
+
+    assert notified == expected
+
+
+def test_device_known_everywhere_is_not_reported_on_any_network(tmp_path, notified):
+    """Added by `dev-detect add` or stored by an older version"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.add(MAC)
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    feed_networks(tracker, [
+        Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX),
+        Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+    ])
+
+    assert notified == []
+
+
+def test_per_network_device_is_reported_once_per_network_without_database(notified):
+    tracker = daemon.DeviceTracker(FailingStorage(), per_network=True)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)] * 2)
+    feed_networks(tracker, [Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX)] * 2)
+
+    assert notified == [MAC, MAC]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_read_only_database_of_older_version(tmp_path, notified):
+    """A database of dev-detect 0.3.1 that is read-only when the daemon starts"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    conn = sqlite3.connect(db_path)
+    conn.execute('CREATE TABLE known_devices (mac text UNIQUE)')
+    conn.executemany('INSERT INTO known_devices (mac) VALUES (?)', [(MAC,), (OTHER_MAC,)])
+    conn.commit()
+    conn.close()
+    os.chmod(db_path, 0o444)
+
+    config = daemon.read_config(ConfigEUci())  # defaults
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), False, config['per_network'])
+    feed_networks(tracker, [
+        Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+        Message(OTHER_MAC, '10.111.222.51', family=2, ifindex=GUEST_IFINDEX),
+    ] * 3 + [Message('02:00:00:00:00:99', '192.168.1.99', family=2, ifindex=IFINDEX)] * 3)
+
+    assert notified == ['02:00:00:00:00:99']
+
+
+def test_both_guest_bridge_names_are_one_network(tmp_path, notified):
+    """reForis renames br-guest_turris of migrated systems to br-guest-turris"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-guest_turris')
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)])
+
+    assert notified == []
+
+
+def test_learned_devices_are_grouped_and_their_hostnames_stored(tmp_path, notified, learned, monkeypatch):
+    leases = tmp_path / 'dhcp.leases'
+    leases.write_text('1731440000 3e:f1:18:4d:d9:23 192.168.1.50 Mac 01:3e:f1:18:4d:d9:23\n')
+    monkeypatch.setattr(notify, 'DNSMASQ_LEASES', str(leases))
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), per_network=True)
+    tracker.start_learning()
+    ipr = FakeIPRoute(
+        links=[Link('RTM_NEWLINK', IFINDEX, 'br-lan'), Link('RTM_NEWLINK', GUEST_IFINDEX, 'br-guest-turris')],
+        neighbours=[
+            Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+            Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX, state=0x04),
+            Message(OTHER_MAC, '192.168.1.51', family=2, ifindex=IFINDEX),
+        ],
+    )
+    daemon.synchronize(ipr, {}, ('br-lan', 'br-guest-turris'), tracker)
+    tracker.finish_learning()
+
+    assert learned == [(MAC, ['br-lan', 'br-guest-turris'], 'Mac'), (OTHER_MAC, ['br-lan'], None)]
+    assert {(row[0], row[2], row[5]) for row in tracker.storage.devices()} == {
+        (MAC, 'br-lan', 'Mac'), (MAC, 'br-guest-turris', 'Mac'), (OTHER_MAC, 'br-lan', None),
+    }
+    assert notified == []

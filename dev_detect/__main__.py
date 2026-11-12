@@ -5,7 +5,7 @@ import os
 import time
 
 from . import notify
-from .constants import DEVICE_STATES, IPV4, IPV6, NTF_PROXY, RTMGRP_LINK, RTMGRP_NEIGH
+from .constants import DEVICE_STATES, IPV4, IPV6, NTF_PROXY, REACHABLE, RTMGRP_LINK, RTMGRP_NEIGH
 from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
 logger = logging.getLogger(__name__)
@@ -16,16 +16,32 @@ DEFAULT_INTERFACES = ('br-lan', 'br-guest-turris', 'br-guest_turris')
 # minimal time in seconds between neighbour table scans after lost messages
 RESYNC_INTERVAL = 30
 
+# Names of one network. Saving the guest network settings in reForis renames the
+# guest bridge of systems migrated from Turris OS 5 to br-guest-turris.
+SAME_NETWORK = (('br-guest-turris', 'br-guest_turris'),)
+
+# how often to record that a known device is still present, in seconds;
+# every write wears out the internal flash a bit
+LAST_SEEN_INTERVAL = 6 * 3600
+
 ADDRMAP = {
     IPV4: '4',
     IPV6: '6'
 }
 
 
-def new_device_notify(mac, ip, addr_family, iface):
+def network_names(iface):
+    """Return all names of the network on the interface"""
+    for names in SAME_NETWORK:
+        if iface in names:
+            return names
+    return (iface,)
+
+
+def new_device_notify(mac, ip, addr_family, iface, on_details=None):
     logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
                 iface, mac, ADDRMAP.get(addr_family), ip)
-    notify.new_device(mac, ip, iface)
+    notify.new_device(mac, ip, iface, on_details)
 
 
 def get_interfaces(ipr, watched_interfaces):
@@ -79,34 +95,151 @@ class DeviceTracker:
     `dev-detect remove` is reported again. A device that cannot be stored is
     kept in memory instead, so that it is reported only once even when the
     database is not writable.
-    """
-    def __init__(self, storage):
-        self.storage = storage
-        self.unsaved = set()
 
-    def is_new(self, mac):
-        if mac in self.unsaved:
+    With per_network, a device is new on each interface it appears on, unless
+    it is known on every interface (added by `dev-detect add` or stored by an
+    older version).
+    """
+    def __init__(self, storage, known_static_leases=False, per_network=False):
+        self.storage = storage
+        self.known_static_leases = known_static_leases
+        self.per_network = per_network
+        self.unsaved = {}  # (mac, iface) or mac -> (mac, iface)
+        self.last_seen_written = {}
+        self.learning = False
+        self.learned = {}  # mac -> interfaces
+
+    def start_learning(self):
+        """Store devices found by the startup scan without reporting each, if the database is empty
+
+        E.g. on the first start, or on a start after the database was cleared
+        (`dev-detect clear` and a restart of the service) or lost, when every
+        device present would be reported. They are reported in one notification.
+        """
+        try:
+            self.learning = self.storage.is_empty()
+        except StorageError as e:
+            logger.error('Cannot read device database: %s', e)
+
+    def finish_learning(self):
+        if not self.learning:
+            return
+        self.learning = False
+        if not self.learned:
+            return
+        logger.info('Device database was empty, %d devices present were stored without reporting each',
+                    len(self.learned))
+        devices = []
+        for mac, ifaces in self.learned.items():
+            _, hostname = notify.dnsmasq_lease(mac)
+            if hostname:
+                try:
+                    self.storage.set_hostname(mac, hostname)
+                except StorageError as e:
+                    logger.warning('Cannot store hostname of device %s: %s', mac, e)
+            devices.append((mac, ifaces, hostname))
+        notify.learned_devices(devices)
+        self.learned = {}
+
+    def is_new(self, mac, iface, present=True):
+        """Is the device new? present means its presence was just confirmed (REACHABLE)"""
+        names = network_names(iface)
+        key = (mac, names[0]) if self.per_network else mac
+        if key in self.unsaved:
             return False
 
         try:
-            if self.storage.search(mac):
+            if self.storage.search(mac, names if self.per_network else None):
+                if present:
+                    self._touch(mac)
                 return False
-            self.storage.store(mac)
         except StorageError as e:
-            logger.error('Cannot record device %s, it will not be reported again until restart: %s', mac, e)
-            self.unsaved.add(mac)
+            self._keep_unsaved(key, mac, iface, e)
+
+        lease_name = self._static_lease(mac)
+        if key not in self.unsaved:
+            self._store(key, mac, iface, lease_name)
+
+        if lease_name is not None:
+            logger.info('Device %s has a static DHCP lease, it is known', mac)
+            return False
+        if self.learning:
+            ifaces = self.learned.setdefault(mac, [])
+            if iface not in ifaces:
+                ifaces.append(iface)
+            return False
+        return True
+
+    def _store(self, key, mac, iface, name):
+        try:
+            self.storage.store(mac, iface)
+            if name:
+                self.storage.set_name(mac, name)
+        except StorageError as e:
+            self._keep_unsaved(key, mac, iface, e)
         else:
             self._store_unsaved()
-        return True
+
+    def _keep_unsaved(self, key, mac, iface, error):
+        logger.error('Cannot record device %s, it will not be reported again until restart: %s', mac, error)
+        self.unsaved[key] = (mac, iface)
+
+    def _static_lease(self, mac):
+        """Return name of static DHCP lease of the device ('' if unnamed), None if there is none"""
+        if not self.known_static_leases:
+            return None
+        try:
+            return static_lease(mac)
+        except Exception:
+            logger.warning('Cannot read static DHCP leases', exc_info=True)
+            return None
+
+    def _touch(self, mac):
+        now = time.monotonic()
+        if now - self.last_seen_written.get(mac, now - LAST_SEEN_INTERVAL) < LAST_SEEN_INTERVAL:
+            return
+        self.last_seen_written[mac] = now
+        try:
+            self.storage.touch(mac)
+        except StorageError as e:  # not worth more than the next attempt in LAST_SEEN_INTERVAL
+            logger.debug('Cannot record that device %s is present: %s', mac, e)
+
+    def remember_details(self, device):
+        """Store hostname found out for the notification (runs in its thread)"""
+        if not device.hostname:
+            return
+        storage = DatabaseStorage(self.storage.db_path)  # a connection cannot be shared by threads
+        try:
+            storage.set_hostname(device.mac, device.hostname)
+        except StorageError as e:
+            logger.warning('Cannot store hostname of device %s: %s', device.mac, e)
+        finally:
+            storage.close()
 
     def _store_unsaved(self):
         """Database works again, store devices that could not be stored before"""
-        for mac in list(self.unsaved):
+        for key, (mac, iface) in list(self.unsaved.items()):
             try:
-                self.storage.store(mac)
+                self.storage.store(mac, iface)
             except StorageError:
                 return
-            self.unsaved.discard(mac)
+            del self.unsaved[key]
+
+
+def static_lease(mac):
+    """Return name of the static DHCP lease of the MAC address ('' if unnamed), None if there is none"""
+    from euci import EUci
+
+    with EUci() as uci:
+        for section, options in uci.get('dhcp', default={}).items():
+            if uci.get('dhcp', section, default='') != 'host':
+                continue
+            macs = options.get('mac', ())
+            if isinstance(macs, str):
+                macs = macs.split()
+            if mac in (other.lower().replace('-', ':') for other in macs):
+                return options.get('name', '')
+    return None
 
 
 def is_device(message, interfaces):
@@ -136,8 +269,9 @@ def process_netlink_message(message, interfaces, tracker):
     if int(mac.split(':')[0], 16) & 0x01:  # multicast or broadcast address
         return
 
-    if tracker.is_new(mac):
-        new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
+    iface = interfaces[message['ifindex']]
+    if tracker.is_new(mac, iface, present=bool(message.get('state', 0) & REACHABLE)):
+        new_device_notify(mac, ip, message['family'], iface, on_details=tracker.remember_details)
 
 
 def scan_neighbours(scanner, interfaces, tracker):
@@ -212,6 +346,16 @@ def open_storage(db_path):
     return DatabaseStorage(db_path)
 
 
+def read_config(uci):
+    return {
+        'db_path': uci.get('dev-detect', 'storage', 'db_path', dtype=str, default=DEFAULT_DB_PATH),
+        'interfaces': uci.get('dev-detect', 'watchlist', 'ifaces', dtype=str, default=DEFAULT_INTERFACES, list=True),
+        'learn_on_empty': uci.get('dev-detect', 'detection', 'learn_on_empty', dtype=bool, default=True),
+        'known_static_leases': uci.get('dev-detect', 'detection', 'known_static_leases', dtype=bool, default=True),
+        'per_network': uci.get('dev-detect', 'detection', 'per_network', dtype=bool, default=True),
+    }
+
+
 def setup_logging(loglevel):
     logging_format = "%(levelname)s: %(message)s"
     logging.basicConfig(level=loglevel, format=logging_format)
@@ -231,25 +375,19 @@ def main():
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
 
     with EUci() as uci:
-        db_path = uci.get(
-            'dev-detect', 'storage', 'db_path',
-            dtype=str,
-            default=DEFAULT_DB_PATH
-        )
-        watched_interfaces = uci.get(
-            'dev-detect', 'watchlist', 'ifaces',
-            dtype=str,
-            default=DEFAULT_INTERFACES,
-            list=True
-        )
+        config = read_config(uci)
+    watched_interfaces = config['interfaces']
 
-    tracker = DeviceTracker(open_storage(db_path))
+    tracker = DeviceTracker(open_storage(config['db_path']), config['known_static_leases'], config['per_network'])
+    if config['learn_on_empty']:
+        tracker.start_learning()
 
     with IPRoute() as ipr, IPRoute() as scanner:
         ipr.bind(groups=RTMGRP_NEIGH | RTMGRP_LINK)  # subscribe to netlink broadcast
 
         interfaces = {}
         synced = synchronize(scanner, interfaces, watched_interfaces, tracker)
+        tracker.finish_learning()
         detect_devices(ipr, interfaces, watched_interfaces, tracker, scanner, sync_needed=not synced)
 
 
