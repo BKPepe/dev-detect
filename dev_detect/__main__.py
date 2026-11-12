@@ -2,10 +2,9 @@ import argparse
 import errno
 import logging
 import os
-import subprocess
 import time
-import threading
 
+from . import notify
 from .constants import DEVICE_STATES, IPV4, IPV6, NTF_PROXY, RTMGRP_LINK, RTMGRP_NEIGH
 from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
@@ -23,28 +22,10 @@ ADDRMAP = {
 }
 
 
-# Use this old code from pakon-dev-detect for time being.
-# dev-detect will probably get packaged and shipped to users sooner than notification system,
-# therefore I guess it is better to use this old function for now than rewritting it
-# piece by piece and then throwing it away later anyway.
-#
-# Notifications are created in external shell script and this is basically wrapper for it.
-# TODO: drop this function and use new notification system instead
 def new_device_notify(mac, ip, addr_family, iface):
-    def new_device_notify_thread(mac, iface):
-        time.sleep(5)
-        try:
-            cmd = ["/usr/libexec/notify_new_device.sh", mac, iface]
-            subprocess.call([arg.encode('utf-8') for arg in cmd])
-        except OSError:
-            print("failed to create notification")
-
     logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
                 iface, mac, ADDRMAP.get(addr_family), ip)
-
-    thread = threading.Thread(target=new_device_notify_thread, args=(mac, iface, ))
-    thread.daemon = True
-    thread.start()
+    notify.new_device(mac, ip, iface)
 
 
 def get_interfaces(ipr, watched_interfaces):
@@ -156,8 +137,6 @@ def process_netlink_message(message, interfaces, tracker):
         return
 
     if tracker.is_new(mac):
-        # interfaces are there just to conform to notify shell script interface
-        # TODO: use interface name elsewhere? omit it in notifications completely?
         new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
 
 

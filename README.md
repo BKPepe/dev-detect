@@ -28,6 +28,19 @@ For full options see help:
 dev-detect --help
 ```
 
+## Notifications
+
+New devices are reported through the Turris notification system (reForis, e-mail, ntfy). The notification is created a few seconds after the device appears, so that it can include all addresses the device uses and the hostname from its DHCP lease:
+
+```
+New device on network lan: Mac
+MAC address: 3e:f1:18:4d:d9:23 (randomized address, vendor unknown)
+IPv4: 192.168.1.50
+IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac
+```
+
+The vendor is looked up by `ouidb`. Devices using a private (randomized) MAC address have no vendor and may be reported again when their address changes.
+
 ## Persistence
 
 Detected devices are stored in sqlite database in order to remember already discovered devices.
